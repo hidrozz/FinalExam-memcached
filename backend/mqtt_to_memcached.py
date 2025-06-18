@@ -1,7 +1,7 @@
 import paho.mqtt.client as mqtt
-from pymemcache.client.base import Client
-import json
+from memcache_wrapper import set, push_to_list
 from datetime import datetime
+import json
 
 MQTT_HOST = "103.23.198.211"
 MQTT_PORT = 1883
@@ -9,28 +9,8 @@ MQTT_USER = "myuser"
 MQTT_PASS = "tugasakhir"
 MQTT_TOPIC = "sensors/report"
 
-m = Client(('localhost', 11211))
-KEY_LOG = "sensor_data_log"
-MAX_LOG = 100
-
-def get_list(key):
-    raw = m.get(key)
-    if raw:
-        try:
-            return json.loads(raw)
-        except:
-            return []
-    return []
-
-def push_list(key, item, maxlen):
-    data = get_list(key)
-    data.insert(0, item)
-    if len(data) > maxlen:
-        data = data[:maxlen]
-    m.set(key, json.dumps(data))
-
 def on_connect(client, userdata, flags, rc):
-    print("[MQTT] Connected with result code", rc)
+    print("[MQTT] Connected:", rc)
     client.subscribe(MQTT_TOPIC)
 
 def on_message(client, userdata, msg):
@@ -38,11 +18,14 @@ def on_message(client, userdata, msg):
         payload = msg.payload.decode()
         data = json.loads(payload)
         data["timestamp"] = datetime.now().isoformat()
-        m.set("latest_sensor_data", json.dumps(data))
-        push_list(KEY_LOG, data, MAX_LOG)
-        print(f"[MQTT->Memcached] Stored: {data}")
+
+        set("latest_sensor_data", data)
+        push_to_list("sensor_data_log", data)
+
+        print("[MQTT -> Memcached] Updated data")
+
     except Exception as e:
-        print("[ERROR] Failed to handle message:", e)
+        print("[MQTT ERROR]", e)
 
 client = mqtt.Client()
 client.username_pw_set(MQTT_USER, MQTT_PASS)
