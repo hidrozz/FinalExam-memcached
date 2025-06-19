@@ -1,16 +1,24 @@
 import paho.mqtt.client as mqtt
-from memcache_wrapper import set, push_to_list
-from datetime import datetime
+import memcache
 import json
+from datetime import datetime
 
-MQTT_HOST = "103.23.198.211"
+# Konfigurasi MQTT (Broker di VPS 1)
+MQTT_HOST = "103.49.239.121"
 MQTT_PORT = 1883
 MQTT_USER = "myuser"
 MQTT_PASS = "tugasakhir"
 MQTT_TOPIC = "sensors/report"
 
+# Konfigurasi Memcached (lokal atau remote)
+mc = memcache.Client(["127.0.0.1:11211"])
+mc.behaviors = {"tcp_nodelay": True, "ketama": True}
+
+KEY_LOG = "sensor_data_log_m"
+MAX_LOG = 100
+
 def on_connect(client, userdata, flags, rc):
-    print("[MQTT] Connected:", rc)
+    print("[MQTT] Connected with result code", rc)
     client.subscribe(MQTT_TOPIC)
 
 def on_message(client, userdata, msg):
@@ -19,13 +27,18 @@ def on_message(client, userdata, msg):
         data = json.loads(payload)
         data["timestamp"] = datetime.now().isoformat()
 
-        set("latest_sensor_data", data)
-        push_to_list("sensor_data_log", data)
+        # Simpan data ke Memcached
+        mc.set("latest_sensor_data_m", json.dumps(data))
 
-        print("[MQTT -> Memcached] Updated data")
+        # Simpan ke log (list)
+        logs = mc.get(KEY_LOG) or []
+        logs.insert(0, data)
+        mc.set(KEY_LOG, logs[:MAX_LOG])
+
+        print(f"[MQTT->Memcached] Stored: {data}")
 
     except Exception as e:
-        print("[MQTT ERROR]", e)
+        print("[ERROR] Failed to handle message:", e)
 
 client = mqtt.Client()
 client.username_pw_set(MQTT_USER, MQTT_PASS)
