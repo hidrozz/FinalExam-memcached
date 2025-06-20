@@ -1,58 +1,42 @@
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from memcache_wrapper import mc
+import threading
 import json
 import time
 from datetime import datetime
-import threading
 import paho.mqtt.publish as publish
+
+from memcache_wrapper import (
+    get_latest_sensor_data, set_latest_sensor_data,
+    get_mode, set_mode,
+    get_relay_status, set_relay_status,
+    log_relay_event, get_sensor_logs, get_relay_logs
+)
+from log_writer import log_latency
 
 app = Flask(__name__)
 CORS(app)
-
-# Konstanta
-KEY_LATEST = "latest_sensor_data_m"
-KEY_LOG = "sensor_data_log_m"
-RELAY_STATUS = "relay_status_m"
-MODE_KEY = "mode_m"
-RELAY_LOG = "relay_log_m"
-MAX_LOG = 100
-MAX_LOG_RELAY = 100
 
 THRESHOLD_SOIL = 50
 ADC_DRY = 3000
 ADC_WET = 1000
 
-# MQTT config untuk relay publish
 def publish_relay_status(status):
     publish.single("sensors/moist_threshold", payload=status,
         hostname="103.76.120.64", port=1883,
         auth={'username': 'myuser', 'password': 'tugasakhir'}
     )
 
-# Logging relay event
-def log_relay_event(status, source):
-    log = {
-        "timestamp": datetime.now().isoformat(),
-        "status": status,
-        "source": source
-    }
-    logs = mc.get(RELAY_LOG) or []
-    logs.insert(0, log)
-    logs = logs[:MAX_LOG_RELAY]
-    mc.set(RELAY_LOG, logs)
-
 @app.route("/api/status")
-def get_status():
-    latest = mc.get(KEY_LATEST)
-    relay_status = mc.get(RELAY_STATUS) or "OFF"
-    mode = mc.get(MODE_KEY) or "AUTO"
+def api_status():
+    start = time.time()
+    data = get_latest_sensor_data()
+    relay_status = get_relay_status() or "OFF"
+    mode = get_mode() or "AUTO"
 
-    if latest:
-        data = latest
-        soil_adc = data.get("soil_moist")
+    if data:
         try:
-            soil_adc = float(soil_adc)
+            soil_adc = float(data.get("soil_moist", 0))
             moisture_percent = max(0, min(100, 100 - ((soil_adc - ADC_WET) / (ADC_DRY - ADC_WET) * 100)))
             data["soil_percent"] = round(moisture_percent, 1)
             data["soil_label"] = "Kering" if moisture_percent < 35 else "Normal" if moisture_percent <= 70 else "Basah"
@@ -72,70 +56,77 @@ def get_status():
 
     data["relay_status"] = relay_status
     data["mode"] = mode
+    end = time.time()
+    log_latency("memcached", "-", "-", "-", f"{(end-start)*1000:.2f}ms")
     return jsonify(data)
 
 @app.route("/api/relay-toggle", methods=["POST"])
 def toggle_relay():
-    current = mc.get(RELAY_STATUS) or "OFF"
+    current = get_relay_status() or "OFF"
     new_status = "OFF" if current == "ON" else "ON"
-    mc.set(RELAY_STATUS, new_status)
+    set_relay_status(new_status)
     log_relay_event(new_status, "manual")
     publish_relay_status(new_status)
     return jsonify({"relay_status": new_status})
 
 @app.route("/api/auto-mode-toggle", methods=["POST"])
 def toggle_mode():
-    current = mc.get(MODE_KEY) or "AUTO"
+    current = get_mode() or "AUTO"
     new_mode = "MANUAL" if current == "AUTO" else "AUTO"
-    mc.set(MODE_KEY, new_mode)
+    set_mode(new_mode)
     return jsonify({"mode": new_mode})
 
 @app.route("/api/chart-data")
 def chart_data():
-    logs = mc.get(KEY_LOG) or []
-    labels = [datetime.fromisoformat(d["timestamp"]).strftime("%H:%M:%S") for d in logs]
-    soil = [d.get("soil_moist", 0) for d in logs]
-    temp = [d.get("env_temp", 0) for d in logs]
-    hum = [d.get("env_hum", 0) for d in logs]
-    ph = [d.get("soil_temp", 0) for d in logs]
+    logs = get_sensor_logs()
+    labels, soil, temp, hum, ph = [], [], [], [], []
+    for d in reversed(logs):
+        try:
+            dt = json.loads(d)
+            labels.append(datetime.fromisoformat(dt["timestamp"]).strftime("%H:%M:%S"))
+            soil.append(dt.get("soil_moist", 0))
+            temp.append(dt.get("env_temp", 0))
+            hum.append(dt.get("env_hum", 0))
+            ph.append(dt.get("soil_temp", 0))
+        except:
+            continue
     return jsonify({
-        "labels": labels[::-1], "soil": soil[::-1], "temperature": temp[::-1],
-        "humidity": hum[::-1], "ph": ph[::-1]
+        "labels": labels, "soil": soil, "temperature": temp,
+        "humidity": hum, "ph": ph
     })
 
 @app.route("/api/relay-log")
-def relay_log():
-    logs = mc.get(RELAY_LOG) or []
-    return jsonify(logs)
+def get_relay():
+    logs = get_relay_logs()
+    return jsonify([json.loads(l) for l in logs])
 
 @app.route("/")
-def serve_dashboard():
-    return send_from_directory('../Frontend', 'index.html')
+def index():
+    return send_from_directory('../frontend', 'index.html')
 
 @app.route("/css/<path:filename>")
-def serve_css(filename):
-    return send_from_directory('../Frontend/css', filename)
+def css(filename):
+    return send_from_directory('../frontend/css', filename)
 
 @app.route("/js/<path:filename>")
-def serve_js(filename):
-    return send_from_directory('../Frontend/js', filename)
+def js(filename):
+    return send_from_directory('../frontend/js', filename)
 
-# Auto Control Thread
 def auto_control_logic():
-    latest = mc.get(KEY_LATEST)
-    mode = mc.get(MODE_KEY) or "AUTO"
-    if not latest or mode != "AUTO":
+    data = get_latest_sensor_data()
+    mode = get_mode() or "AUTO"
+    if not data or mode != "AUTO":
         return
     try:
-        soil_adc = float(latest.get("soil_moist", 0))
+        soil_adc = float(data.get("soil_moist", 0))
         moisture_percent = max(0, min(100, 100 - ((soil_adc - ADC_WET) / (ADC_DRY - ADC_WET) * 100)))
-        current_status = mc.get(RELAY_STATUS) or "OFF"
+        current_status = get_relay_status() or "OFF"
         if moisture_percent < THRESHOLD_SOIL and current_status != "ON":
-            mc.set(RELAY_STATUS, "ON")
+            set_relay_status("ON")
             log_relay_event("ON", "auto")
             publish_relay_status("ON")
         elif moisture_percent >= THRESHOLD_SOIL and current_status != "OFF":
-            mc.set(RELAY_STATUS, "OFF")
+            set_relay_status("OFF")
             log_relay_event("OFF", "auto")
             publish_relay_status("OFF")
     except Exception as e:
